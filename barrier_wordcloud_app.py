@@ -152,10 +152,38 @@ def matching_column(dataframe: pd.DataFrame, wanted: str) -> str | None:
 
 
 def age_group_for(value: object) -> str | None:
-    """Convert a numeric age into a standard, sortable customer age group."""
-    age = pd.to_numeric(value, errors="coerce")
-    if pd.isna(age) or age < 0:
+    """Convert numeric ages or common age-range labels into a standard group."""
+    if pd.isna(value):
         return None
+
+    text = str(value).strip().casefold()
+    normalized_text = re.sub(r"\s+", "", text).replace("–", "-").replace("—", "-")
+    known_labels = {
+        "under18": "Under 18",
+        "<18": "Under 18",
+        "lessthan18": "Under 18",
+        "18-24": "18–24",
+        "25-34": "25–34",
+        "35-44": "35–44",
+        "45-54": "45–54",
+        "55-64": "55–64",
+        "65+": "65+",
+        "65andover": "65+",
+        "65orolder": "65+",
+    }
+    label_without_years = normalized_text.replace("yearsold", "").replace("years", "")
+    if label_without_years in known_labels:
+        return known_labels[label_without_years]
+
+    age = pd.to_numeric(value, errors="coerce")
+    if pd.isna(age):
+        numbers = re.findall(r"\d+(?:\.\d+)?", text)
+        if numbers:
+            age = float(numbers[0])
+    if pd.isna(age) or age < 0:
+        # For an unfamiliar category, preserve the file's label instead of
+        # silently producing an empty age-filter menu.
+        return str(value).strip() or None
     if age < 18:
         return "Under 18"
     if age <= 24:
@@ -183,11 +211,15 @@ def filter_demographics(dataframe: pd.DataFrame) -> pd.DataFrame:
 
     if age_column:
         age_groups = dataframe[age_column].map(age_group_for)
-        available_groups = [
+        standard_groups = [
             group
             for group in ["Under 18", "18–24", "25–34", "35–44", "45–54", "55–64", "65+"]
             if group in set(age_groups.dropna())
         ]
+        other_groups = sorted(
+            set(age_groups.dropna()) - set(standard_groups), key=str.casefold
+        )
+        available_groups = standard_groups + other_groups
         selected_age_groups = filter1.multiselect(
             "Age group",
             available_groups,
@@ -231,7 +263,26 @@ def filter_demographics(dataframe: pd.DataFrame) -> pd.DataFrame:
     else:
         filter3.caption("Gender filter unavailable: no Gender column found.")
 
-    return dataframe.loc[mask].copy()
+    matching = dataframe.loc[mask].copy()
+    if matching.empty:
+        st.warning("No customers match the selected demographic filters.")
+        return matching
+
+    requested_count = st.number_input(
+        "Number of customers to simulate",
+        min_value=1,
+        max_value=len(matching),
+        value=len(matching),
+        step=1,
+        help=(
+            "Choose how many of the matching demographic profiles should respond. "
+            "When fewer are selected, the app takes a reproducible random sample."
+        ),
+    )
+    requested_count = int(requested_count)
+    if requested_count < len(matching):
+        matching = matching.sample(n=requested_count, random_state=42).sort_index()
+    return matching
 
 
 def configured_api_key() -> str:
@@ -253,12 +304,18 @@ st.caption(
 
 with st.sidebar:
     st.header("Model settings")
-    api_key = st.text_input(
-        "Google API key",
-        value=configured_api_key(),
-        type="password",
-        help="Use GOOGLE_API_KEY in the environment or .streamlit/secrets.toml to avoid entering it here.",
-    )
+    api_key = configured_api_key()
+    if api_key:
+        st.success("Google API key is configured securely.")
+    else:
+        api_key = st.text_input(
+            "Google API key",
+            type="password",
+            help=(
+                "For local use only. On Streamlit Cloud, configure GOOGLE_API_KEY "
+                "in the app's Secrets settings."
+            ),
+        )
     model_name = st.text_input("Gemini model", value="gemini-2.5-flash-lite")
     uploaded_file = st.file_uploader(
         "Optional demographics file",
