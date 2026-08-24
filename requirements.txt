@@ -1,0 +1,7 @@
+streamlit>=1.42
+pandas>=2.0
+openpyxl>=3.1
+matplotlib>=3.8
+wordcloud>=1.9
+langchain-google-genai>=3.0
+pydantic>=2.7
