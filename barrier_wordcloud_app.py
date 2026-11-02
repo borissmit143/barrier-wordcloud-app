@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import time
+import hashlib
 from io import BytesIO
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from wordcloud import STOPWORDS, WordCloud
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_USERS_FILE = APP_DIR / "users.xlsx"
+MODEL_NAME = "gemini-3.1-flash-lite"
 
 
 class BarrierResponse(BaseModel):
@@ -49,20 +51,56 @@ def make_prompt(
     firm_name: str,
     service: str,
     description: str,
+    customer_persona: str,
     profile: dict[str, str],
+    perspective_lens: str,
+    earlier_barriers: list[str],
 ) -> str:
     profile_lines = "\n".join(f"- {key}: {value}" for key, value in profile.items())
+    earlier_text = (
+        "\n".join(f"- {barrier}" for barrier in earlier_barriers[-12:])
+        if earlier_barriers
+        else "None yet."
+    )
     return f"""You are role-playing a potential customer with this demographic profile:
 {profile_lines}
 
 Firm: {firm_name}
 Service provided: {service}
 Service description: {description}
+Customer persona: {customer_persona}
+
+Perspective lens to consider first: {perspective_lens}
+
+Barriers already mentioned by other simulated customers:
+{earlier_text}
 
 From this customer's perspective, identify the single most important realistic
 barrier that could prevent or delay adoption of the firm's service. Base the
 answer on the entire demographic profile, but do not stereotype or invent facts.
-Return exactly one concise barrier (one sentence, no list, no preamble)."""
+Use the perspective lens only when it is genuinely plausible for this profile.
+Avoid repeating an earlier barrier unless it is clearly the most credible answer;
+if the underlying issue is similar, make the customer's specific reason distinct.
+Return exactly one concise and concrete barrier (one sentence, no list, no preamble)."""
+
+
+def perspective_lens(profile: dict[str, str]) -> str:
+    """Assign profiles a stable lens to encourage credible response variety."""
+    lenses = [
+        "price, fees, or perceived value",
+        "trust, credibility, or reputation",
+        "content or service relevance",
+        "ease of use or accessibility",
+        "time, effort, or convenience",
+        "privacy, security, or data use",
+        "social, cultural, or values fit",
+        "awareness or understanding of the service",
+        "availability or geographic fit",
+        "preference for existing alternatives",
+    ]
+    profile_key = "|".join(f"{key}={value}" for key, value in profile.items())
+    digest = hashlib.sha256(profile_key.encode("utf-8")).digest()
+    return lenses[int.from_bytes(digest[:4], "big") % len(lenses)]
 
 
 def generate_barriers(
@@ -70,16 +108,17 @@ def generate_barriers(
     firm_name: str,
     service: str,
     description: str,
+    customer_persona: str,
     api_key: str,
-    model_name: str,
 ) -> pd.DataFrame:
     llm = ChatGoogleGenerativeAI(
-        model=model_name,
-        temperature=0.4,
+        model=MODEL_NAME,
+        temperature=0.7,
         google_api_key=api_key,
     ).with_structured_output(BarrierResponse)
 
     records: list[dict[str, object]] = []
+    completed_barriers: list[str] = []
     progress = st.progress(0, text="Preparing customer profiles...")
     total = len(demographics)
 
@@ -90,13 +129,22 @@ def generate_barriers(
             if (value := clean_value(raw_value)) is not None
         }
         record: dict[str, object] = {"source_row": source_index + 2, **profile}
-        prompt = make_prompt(firm_name, service, description, profile)
+        prompt = make_prompt(
+            firm_name,
+            service,
+            description,
+            customer_persona,
+            profile,
+            perspective_lens(profile),
+            completed_barriers,
+        )
 
         for attempt in range(3):
             try:
                 response = llm.invoke(prompt)
                 record["Adoption Barrier"] = response.barrier.strip()
                 record["Status"] = "Success"
+                completed_barriers.append(record["Adoption Barrier"])
                 break
             except Exception as exc:  # Preserve the other customers if one call fails.
                 if attempt < 2:
@@ -286,13 +334,14 @@ def filter_demographics(dataframe: pd.DataFrame) -> pd.DataFrame:
 
 
 def configured_api_key() -> str:
-    """Read a key without failing when no Streamlit secrets file exists."""
-    if environment_key := os.getenv("GOOGLE_API_KEY"):
-        return environment_key
+    """Read the Gemini key from Streamlit secrets (or the host environment)."""
     try:
-        return str(st.secrets.get("GOOGLE_API_KEY", ""))
+        secret_key = st.secrets.get("GOOGLE_API_KEY") or st.secrets.get("GEMINI_API_KEY")
+        if secret_key:
+            return str(secret_key)
     except Exception:
-        return ""
+        pass
+    return os.getenv("GOOGLE_API_KEY", "") or os.getenv("GEMINI_API_KEY", "")
 
 
 st.set_page_config(page_title="Customer Adoption Barrier Word Cloud", layout="wide")
@@ -308,15 +357,10 @@ with st.sidebar:
     if api_key:
         st.success("Google API key is configured securely.")
     else:
-        api_key = st.text_input(
-            "Google API key",
-            type="password",
-            help=(
-                "For local use only. On Streamlit Cloud, configure GOOGLE_API_KEY "
-                "in the app's Secrets settings."
-            ),
+        st.error(
+            "Google API key not found. Add GOOGLE_API_KEY to Streamlit secrets."
         )
-    model_name = st.text_input("Gemini model", value="gemini-2.5-flash-lite")
+    st.caption(f"Model: `{MODEL_NAME}`")
     uploaded_file = st.file_uploader(
         "Optional demographics file",
         type=["xlsx", "xls", "csv"],
@@ -331,6 +375,18 @@ description = st.text_area(
     "Service description",
     placeholder="Describe what the service does, how it is delivered, and its intended customers.",
     height=120,
+)
+customer_persona = st.text_area(
+    "Customer persona",
+    placeholder=(
+        "Describe the target customer's goals, needs, behaviors, motivations, "
+        "and concerns."
+    ),
+    help=(
+        "This shared persona guides every simulation; each spreadsheet row adds "
+        "that customer's demographic details."
+    ),
+    height=140,
 )
 
 try:
@@ -358,6 +414,7 @@ if st.button("Generate adoption barriers", type="primary", use_container_width=T
             "firm name": firm_name,
             "service provided": service,
             "service description": description,
+            "customer persona": customer_persona,
             "Google API key": api_key,
         }.items()
         if not value.strip()
@@ -369,7 +426,12 @@ if st.button("Generate adoption barriers", type="primary", use_container_width=T
     else:
         with st.spinner("Simulating customer responses..."):
             st.session_state["barrier_results"] = generate_barriers(
-                filtered_demographics, firm_name, service, description, api_key, model_name
+                filtered_demographics,
+                firm_name,
+                service,
+                description,
+                customer_persona,
+                api_key,
             )
             st.session_state["result_firm"] = firm_name
 
