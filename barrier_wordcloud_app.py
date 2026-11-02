@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import re
 import time
-import hashlib
 from io import BytesIO
 from pathlib import Path
 
@@ -53,15 +52,8 @@ def make_prompt(
     description: str,
     customer_persona: str,
     profile: dict[str, str],
-    perspective_lens: str,
-    earlier_barriers: list[str],
 ) -> str:
     profile_lines = "\n".join(f"- {key}: {value}" for key, value in profile.items())
-    earlier_text = (
-        "\n".join(f"- {barrier}" for barrier in earlier_barriers[-12:])
-        if earlier_barriers
-        else "None yet."
-    )
     return f"""You are role-playing a potential customer with this demographic profile:
 {profile_lines}
 
@@ -70,37 +62,10 @@ Service provided: {service}
 Service description: {description}
 Customer persona: {customer_persona}
 
-Perspective lens to consider first: {perspective_lens}
-
-Barriers already mentioned by other simulated customers:
-{earlier_text}
-
 From this customer's perspective, identify the single most important realistic
 barrier that could prevent or delay adoption of the firm's service. Base the
 answer on the entire demographic profile, but do not stereotype or invent facts.
-Use the perspective lens only when it is genuinely plausible for this profile.
-Avoid repeating an earlier barrier unless it is clearly the most credible answer;
-if the underlying issue is similar, make the customer's specific reason distinct.
 Return exactly one concise and concrete barrier (one sentence, no list, no preamble)."""
-
-
-def perspective_lens(profile: dict[str, str]) -> str:
-    """Assign profiles a stable lens to encourage credible response variety."""
-    lenses = [
-        "price, fees, or perceived value",
-        "trust, credibility, or reputation",
-        "content or service relevance",
-        "ease of use or accessibility",
-        "time, effort, or convenience",
-        "privacy, security, or data use",
-        "social, cultural, or values fit",
-        "awareness or understanding of the service",
-        "availability or geographic fit",
-        "preference for existing alternatives",
-    ]
-    profile_key = "|".join(f"{key}={value}" for key, value in profile.items())
-    digest = hashlib.sha256(profile_key.encode("utf-8")).digest()
-    return lenses[int.from_bytes(digest[:4], "big") % len(lenses)]
 
 
 def generate_barriers(
@@ -118,7 +83,6 @@ def generate_barriers(
     ).with_structured_output(BarrierResponse)
 
     records: list[dict[str, object]] = []
-    completed_barriers: list[str] = []
     progress = st.progress(0, text="Preparing customer profiles...")
     total = len(demographics)
 
@@ -135,8 +99,6 @@ def generate_barriers(
             description,
             customer_persona,
             profile,
-            perspective_lens(profile),
-            completed_barriers,
         )
 
         for attempt in range(3):
@@ -144,7 +106,6 @@ def generate_barriers(
                 response = llm.invoke(prompt)
                 record["Adoption Barrier"] = response.barrier.strip()
                 record["Status"] = "Success"
-                completed_barriers.append(record["Adoption Barrier"])
                 break
             except Exception as exc:  # Preserve the other customers if one call fails.
                 if attempt < 2:
