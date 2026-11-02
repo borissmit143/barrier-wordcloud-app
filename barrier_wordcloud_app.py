@@ -78,7 +78,7 @@ def generate_barriers(
 ) -> pd.DataFrame:
     llm = ChatGoogleGenerativeAI(
         model=MODEL_NAME,
-        temperature=0.7,
+        temperature=1.2,
         google_api_key=api_key,
     ).with_structured_output(BarrierResponse)
 
